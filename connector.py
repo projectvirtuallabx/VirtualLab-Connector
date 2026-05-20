@@ -1,17 +1,5 @@
 """
 VirtualLab MeshCentral Connector Service
-=========================================
-Replaces Node.js logic for generating MeshCentral RDP links and emailing them.
-
-Environment Variables:
-  BACKEND_POLL_URL          Full URL to poll for tasks  e.g. https://vlab-backend-dl07.onrender.com/connector/pending-task
-  BACKEND_CALLBACK_URL      Full URL to post results    e.g. https://vlab-backend-dl07.onrender.com/connector/result
-  SECRET_TOKEN              Bearer token (must match CONNECTOR_SECRET_TOKEN on backend)
-  SMTP_HOST                 SMTP server (default: smtp.gmail.com)
-  SMTP_PORT                 SMTP port   (default: 587)
-  SMTP_USE_TLS              Use STARTTLS (default: true)
-  SERVICE_PORT              Port for --serve mode (default: 8000)
-  SERVICE_HOST              Host for --serve mode (default: 0.0.0.0)
 """
 
 from dotenv import load_dotenv
@@ -43,27 +31,29 @@ log = logging.getLogger("virtuallab.connector")
 
 
 # ---------------------------------------------------------------------------
-# Hardcoded sender email credentials
+# Hardcoded config
 # ---------------------------------------------------------------------------
 
 SENDER_EMAIL    = "virtuallabx26@gmail.com"
 SENDER_APP_PASS = "ibgk hiqx oqdc pqcg"
 
+BACKEND_POLL_URL     = "https://vlab-backend-dl07.onrender.com/connector/pending-task"
+BACKEND_CALLBACK_URL = "https://vlab-backend-dl07.onrender.com/connector/result"
+SECRET_TOKEN         = "supersecret123"
 
-# ---------------------------------------------------------------------------
-# Lab Name -> MeshCentral Node ID mapping
-# Lab names must exactly match what the frontend sends as labName
-# ---------------------------------------------------------------------------
+MESHCTRL_PATH    = r"D:\mesh\node_modules\meshcentral\meshctrl.js"
+MESHCENTRAL_URL  = "wss://mesh.virtuallabx.com"
+MESHCENTRAL_USER = "admin"
+MESHCENTRAL_PASS = "admin"
+MESHCTRL_CWD     = r"D:\mesh"
 
 LAB_NODE_MAP: dict[str, str] = {
     "FROST Lab": "33aDw0y$Poy63kz8w2dCEyk2TR1VN0wexLM2PTFwq9FCyIg6mqjms24Mlv4F9cwb",
 }
 
-MESHCTRL_PATH = r"D:\\mesh\\node_modules\\meshcentral\\meshctrl.js"
-MESHCENTRAL_URL = "wss://mesh.virtuallabx.com"
-MESHCENTRAL_USER = "admin"
-MESHCENTRAL_PASS = "admin"
-MESHCTRL_CWD = r"D:\\mesh"
+SMTP_HOST    = "smtp.gmail.com"
+SMTP_PORT    = 587
+SMTP_USE_TLS = True
 
 
 # ---------------------------------------------------------------------------
@@ -106,14 +96,6 @@ class ConnectorResult:
     stdout:    str
     stderr:    str
     shareId:   Optional[str] = None
-
-
-# ---------------------------------------------------------------------------
-# Env helpers
-# ---------------------------------------------------------------------------
-
-def _env(key: str, default: str = "") -> str:
-    return os.environ.get(key, default)
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +150,6 @@ def generate_rdp_link(payload: BookingPayload) -> tuple[Optional[str], Optional[
     local_time = utc_time.astimezone()
     start_str  = local_time.strftime("%Y-%m-%dT%H:%M:%S")
 
-    # Resolve node ID from map (use payload.meshNodeId as fallback)
     mesh_node_id = LAB_NODE_MAP.get(payload.labName, payload.meshNodeId)
 
     cmd = [
@@ -242,10 +223,6 @@ def revoke_rdp_link(payload: BookingPayload) -> tuple[bool, str, str]:
 # ---------------------------------------------------------------------------
 
 def send_email(payload: BookingPayload, rdp_link: str) -> Optional[str]:
-    smtp_host = _env("SMTP_HOST", "smtp.gmail.com")
-    smtp_port = int(_env("SMTP_PORT", "587"))
-    use_tls   = _env("SMTP_USE_TLS", "true").lower() not in ("false", "0", "no")
-
     subject = f"Your VirtualLab RDP Link - {payload.labName}"
 
     text_body = f"""
@@ -290,8 +267,8 @@ Click the link above to connect. It will expire at the end of your booking windo
     msg.attach(MIMEText(html_body, "html"))
 
     try:
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            if use_tls:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            if SMTP_USE_TLS:
                 server.starttls()
             server.login(SENDER_EMAIL, SENDER_APP_PASS)
             server.sendmail(SENDER_EMAIL, [payload.userEmail], msg.as_string())
@@ -308,15 +285,11 @@ Click the link above to connect. It will expire at the end of your booking windo
 # ---------------------------------------------------------------------------
 
 def post_result_to_backend(result: ConnectorResult, callback_url: Optional[str] = None) -> bool:
-    url = callback_url or _env("BACKEND_CALLBACK_URL")
-    if not url:
-        log.warning("No BACKEND_CALLBACK_URL set — result not posted for bookingId=%s", result.bookingId)
-        return False
-
-    token   = _env("SECRET_TOKEN")
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    url     = callback_url or BACKEND_CALLBACK_URL
+    headers = {
+        "Content-Type":  "application/json",
+        "Authorization": f"Bearer {SECRET_TOKEN}",
+    }
 
     try:
         resp = requests.post(url, json=asdict(result), headers=headers, timeout=15)
@@ -429,7 +402,6 @@ def _handle_status_update(payload: BookingPayload) -> ConnectorResult:
 # ---------------------------------------------------------------------------
 
 def parse_payload(data: dict) -> BookingPayload:
-    # Backend sends these fields from bookings.routes.ts connectorPayload
     required = ["bookingId", "userId", "userEmail", "labName", "start", "end", "durationMinutes"]
     missing  = [f for f in required if f not in data]
     if missing:
@@ -437,7 +409,6 @@ def parse_payload(data: dict) -> BookingPayload:
 
     lab_name = data["labName"]
 
-    # meshNodeId: use map if lab is known, otherwise use what backend sent
     if lab_name in LAB_NODE_MAP:
         mesh_node_id = LAB_NODE_MAP[lab_name]
         log.info("Resolved labName='%s' -> meshNodeId from map", lab_name)
@@ -468,27 +439,20 @@ def parse_payload(data: dict) -> BookingPayload:
 # ---------------------------------------------------------------------------
 
 def poll_backend() -> None:
-    backend_url = _env("BACKEND_POLL_URL")
-    token       = _env("SECRET_TOKEN")
+    headers = {
+        "Content-Type":  "application/json",
+        "Authorization": f"Bearer {SECRET_TOKEN}",
+    }
 
-    if not backend_url:
-        log.error("BACKEND_POLL_URL not set. Example: https://vlab-backend-dl07.onrender.com/connector/pending-task")
-        sys.exit(1)
-
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    log.info("Starting polling loop → %s", backend_url)
+    log.info("Starting polling loop -> %s", BACKEND_POLL_URL)
 
     while True:
         try:
             log.info("Polling backend...")
-            resp = requests.get(backend_url, headers=headers, timeout=10)
+            resp = requests.get(BACKEND_POLL_URL, headers=headers, timeout=10)
 
             if resp.status_code == 200:
                 data = resp.json()
-
                 if not data:
                     log.info("No pending task.")
                 else:
@@ -506,7 +470,7 @@ def poll_backend() -> None:
                         log.error("Payload error: %s", exc)
 
             elif resp.status_code == 401:
-                log.error("Unauthorized — check SECRET_TOKEN matches backend CONNECTOR_SECRET_TOKEN")
+                log.error("Unauthorized — SECRET_TOKEN mismatch with backend")
             else:
                 log.warning("Unexpected status %s from backend", resp.status_code)
 
@@ -551,13 +515,10 @@ def run_server(host: str, port: int) -> None:
         log.error("Flask not installed. Run: pip install flask")
         sys.exit(1)
 
-    app          = Flask("virtuallab.connector")
-    secret_token = _env("SECRET_TOKEN")
+    app = Flask("virtuallab.connector")
 
     def _check_auth() -> Optional[tuple]:
-        if not secret_token:
-            return None
-        if request.headers.get("Authorization") != f"Bearer {secret_token}":
+        if request.headers.get("Authorization") != f"Bearer {SECRET_TOKEN}":
             return jsonify({"error": "Unauthorized"}), 401
         return None
 
@@ -600,9 +561,9 @@ def run_server(host: str, port: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="VirtualLab MeshCentral Connector")
     parser.add_argument("--serve", action="store_true", help="Run as Flask web service.")
-    parser.add_argument("--json",  metavar="JSON",      help="Booking payload as JSON string (CLI mode).")
-    parser.add_argument("--host",  default=_env("SERVICE_HOST", "0.0.0.0"))
-    parser.add_argument("--port",  type=int, default=int(_env("SERVICE_PORT", "8000")))
+    parser.add_argument("--json",  metavar="JSON",      help="Booking payload as JSON string.")
+    parser.add_argument("--host",  default="0.0.0.0")
+    parser.add_argument("--port",  type=int, default=8000)
     args = parser.parse_args()
 
     if args.serve:
