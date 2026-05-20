@@ -37,8 +37,8 @@ log = logging.getLogger("virtuallab.connector")
 SENDER_EMAIL    = "virtuallabx26@gmail.com"
 SENDER_APP_PASS = "ibgk hiqx oqdc pqcg"
 
-BACKEND_POLL_URL     = "https://vlab-backend-dl07.onrender.com/connector/pending-task"
-BACKEND_CALLBACK_URL = "https://vlab-backend-dl07.onrender.com/connector/result"
+BACKEND_POLL_URL     = "https://vlab-backend-dl07.onrender.com/connector/poll"
+BACKEND_CALLBACK_URL = "https://vlab-backend-dl07.onrender.com/connector/callback"
 SECRET_TOKEN         = "supersecret123"
 
 MESHCTRL_PATH    = r"D:\mesh\node_modules\meshcentral\meshctrl.js"
