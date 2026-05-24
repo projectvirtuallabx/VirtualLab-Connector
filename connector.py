@@ -141,6 +141,22 @@ def _extract_share_id(text: str) -> Optional[str]:
     return None
 
 
+def _extract_all_share_ids(text: str) -> list[str]:
+    """Extract all share IDs from meshctrl devicesharing list output."""
+    share_ids = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.lower().startswith("shareid:"):
+            sid = line.split(":", 1)[1].strip()
+            if sid:
+                share_ids.append(sid)
+        elif re.match(r"^id\s*:", line, flags=re.IGNORECASE):
+            sid = line.split(":", 1)[1].strip()
+            if sid:
+                share_ids.append(sid)
+    return share_ids
+
+
 # ---------------------------------------------------------------------------
 # RDP generation
 # ---------------------------------------------------------------------------
@@ -191,31 +207,67 @@ def generate_rdp_link(payload: BookingPayload) -> tuple[Optional[str], Optional[
 
 
 def revoke_rdp_link(payload: BookingPayload) -> tuple[bool, str, str]:
-    if not payload.shareId:
-        err = "Missing shareId for BOOKING_DELETE task."
-        log.error(err)
-        return False, "", err
-
     mesh_node_id = LAB_NODE_MAP.get(payload.labName, payload.meshNodeId)
 
-    cmd = [
-        "node",
-        MESHCTRL_PATH,
+    # --- Path 1: shareId known — remove directly ---
+    if payload.shareId:
+        log.info("Revoking share by shareId for bookingId=%s shareId=%s", payload.bookingId, payload.shareId)
+        cmd = [
+            "node", MESHCTRL_PATH,
+            "devicesharing",
+            "--url",       MESHCENTRAL_URL,
+            "--loginuser", MESHCENTRAL_USER,
+            "--loginpass", MESHCENTRAL_PASS,
+            "--id",        mesh_node_id,
+            "--remove",    payload.shareId,
+        ]
+        returncode, stdout, stderr = _run_meshctrl(cmd)
+        output = stdout + stderr
+        log.info("MeshCtrl Revoke Output: %s", output)
+        success = returncode == 0
+        if success:
+            log.info("Successfully revoked shareId=%s for bookingId=%s", payload.shareId, payload.bookingId)
+        else:
+            log.warning("Failed to revoke shareId=%s rc=%s", payload.shareId, returncode)
+        return success, stdout, stderr
+
+    # --- Path 2: no shareId — list all shares and remove all for this node ---
+    log.warning("No shareId for bookingId=%s — listing all shares on node %s", payload.bookingId, mesh_node_id)
+    cmd_list = [
+        "node", MESHCTRL_PATH,
         "devicesharing",
         "--url",       MESHCENTRAL_URL,
         "--loginuser", MESHCENTRAL_USER,
         "--loginpass", MESHCENTRAL_PASS,
         "--id",        mesh_node_id,
-        "--remove",    payload.shareId,
     ]
-
-    log.info("Revoking share for bookingId=%s shareId=%s", payload.bookingId, payload.shareId)
-    returncode, stdout, stderr = _run_meshctrl(cmd)
+    returncode, stdout, stderr = _run_meshctrl(cmd_list)
     output = stdout + stderr
-    log.info("MeshCtrl Revoke Output: %s", output)
+    log.info("MeshCtrl List Shares Output: %s", output)
 
-    success = returncode == 0 and ("ok" in output.lower() or stderr == "")
-    return success, stdout, stderr
+    share_ids = _extract_all_share_ids(output)
+    if not share_ids:
+        log.warning("No active shares found on node %s for bookingId=%s", mesh_node_id, payload.bookingId)
+        return False, stdout, stderr
+
+    log.info("Found %d shares to revoke for bookingId=%s: %s", len(share_ids), payload.bookingId, share_ids)
+    any_success = False
+    for sid in share_ids:
+        cmd_remove = [
+            "node", MESHCTRL_PATH,
+            "devicesharing",
+            "--url",       MESHCENTRAL_URL,
+            "--loginuser", MESHCENTRAL_USER,
+            "--loginpass", MESHCENTRAL_PASS,
+            "--id",        mesh_node_id,
+            "--remove",    sid,
+        ]
+        rc, so, se = _run_meshctrl(cmd_remove)
+        log.info("Removed share %s rc=%s", sid, rc)
+        if rc == 0:
+            any_success = True
+
+    return any_success, stdout, stderr
 
 
 # ---------------------------------------------------------------------------
@@ -295,8 +347,10 @@ def post_result_to_backend(result: ConnectorResult, callback_url: Optional[str] 
         resp = requests.post(url, json=asdict(result), headers=headers, timeout=15)
         resp.raise_for_status()
         log.info(
-            "Posted result to backend for bookingId=%s (status=%s rdpLink=%s)",
-            result.bookingId, resp.status_code, "set" if result.rdpLink else "none",
+            "Posted result to backend for bookingId=%s (status=%s rdpLink=%s shareId=%s)",
+            result.bookingId, resp.status_code,
+            "set" if result.rdpLink else "none",
+            result.shareId or "none",
         )
         return True
     except Exception as exc:
@@ -361,6 +415,10 @@ def _handle_generate_rdp(payload: BookingPayload) -> ConnectorResult:
 
 
 def _handle_booking_delete(payload: BookingPayload) -> ConnectorResult:
+    log.info(
+        "Handling BOOKING_DELETE for bookingId=%s shareId=%s",
+        payload.bookingId, payload.shareId or "none"
+    )
     success, stdout, stderr = revoke_rdp_link(payload)
     result = ConnectorResult(
         bookingId=payload.bookingId,
@@ -462,9 +520,10 @@ def poll_backend() -> None:
                         payload = parse_payload(data)
                         result  = dispatch_task(payload)
                         log.info(
-                            "Task done: bookingId=%s success=%s rdpLink=%s",
+                            "Task done: bookingId=%s success=%s rdpLink=%s shareId=%s",
                             result.bookingId, result.success,
                             "set" if result.rdpLink else "none",
+                            result.shareId or "none",
                         )
                     except ValueError as exc:
                         log.error("Payload error: %s", exc)
