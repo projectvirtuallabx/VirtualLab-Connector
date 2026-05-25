@@ -274,31 +274,28 @@ def revoke_rdp_link(payload: BookingPayload) -> tuple[bool, str, str]:
 # Email
 # ---------------------------------------------------------------------------
 
-def send_email(payload: BookingPayload, rdp_link: str) -> Optional[str]:
-    subject = f"Your VirtualLab RDP Link - {payload.labName}"
+def send_email(payload: BookingPayload) -> Optional[str]:
+    subject = f"VirtualLab Booking Confirmed - {payload.labName}"
 
     text_body = f"""
 Hello,
 
-Your remote desktop session for {payload.labName} is ready.
+Your booking for {payload.labName} has been confirmed.
 
-  RDP Link  : {rdp_link}
   Booking ID: {payload.bookingId}
   Start     : {payload.start}
   End       : {payload.end}
 
-Click the link above to connect. It will expire at the end of your booking window.
+You can access your remote session from the VirtualLab website during your booking window.
 
 - The VirtualLab Team
 """
 
     html_body = f"""
 <html><body style="font-family:Arial,sans-serif;color:#333;max-width:600px;margin:auto">
-  <h2 style="color:#1a73e8">Your VirtualLab RDP Link</h2>
-  <p>Your remote desktop session for <strong>{payload.labName}</strong> is ready.</p>
+  <h2 style="color:#1a73e8">Booking Confirmed</h2>
+  <p>Your booking for <strong>{payload.labName}</strong> has been confirmed.</p>
   <table style="border-collapse:collapse;width:100%">
-    <tr><td style="padding:6px;font-weight:bold">RDP Link</td>
-        <td style="padding:6px"><a href="{rdp_link}">{rdp_link}</a></td></tr>
     <tr><td style="padding:6px;font-weight:bold">Booking ID</td>
         <td style="padding:6px">{payload.bookingId}</td></tr>
     <tr><td style="padding:6px;font-weight:bold">Start</td>
@@ -306,7 +303,7 @@ Click the link above to connect. It will expire at the end of your booking windo
     <tr><td style="padding:6px;font-weight:bold">End</td>
         <td style="padding:6px">{payload.end}</td></tr>
   </table>
-  <p>Click the link above to connect. It expires at the end of your booking window.</p>
+  <p>You can access your remote session from the VirtualLab website during your booking window.</p>
   <p style="color:#888;font-size:12px">- The VirtualLab Team</p>
 </body></html>
 """
@@ -391,7 +388,7 @@ def _handle_generate_rdp(payload: BookingPayload) -> ConnectorResult:
 
     email_error: Optional[str] = None
     if rdp_link:
-        email_error = send_email(payload, rdp_link)
+        email_error = send_email(payload)
     else:
         log.warning("Skipping email — no RDP link for bookingId=%s", payload.bookingId)
 

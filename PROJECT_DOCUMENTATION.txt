@@ -1,0 +1,709 @@
+
+================================================================================
+                    VIRTUAL LAB - MESHCENTRAL CONNECTOR
+                         PROJECT DOCUMENTATION
+================================================================================
+
+Document Version : 1.0
+Project Name     : VirtualLab-Connector
+Primary Language : Python 3
+Last Updated     : May 2026
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+  1.  Executive Summary and Project Aim
+  2.  Problem Statement and Solution Overview
+  3.  System Architecture
+  4.  Project Structure
+  5.  Technology Stack and Dependencies
+  6.  Core Components (Detailed)
+  7.  Data Models
+  8.  Task Types and Business Logic
+  9.  Main Code Snippets
+ 10.  Backend Integration (Poll and Callback)
+ 11.  MeshCentral Integration
+ 12.  Email Notification System
+ 13.  Operating Modes
+ 14.  HTTP API Reference (Flask Mode)
+ 15.  Configuration Reference
+ 16.  Deployment and Execution
+ 17.  Security Considerations
+ 18.  Error Handling and Logging
+ 19.  Limitations and Future Enhancements
+ 20.  Conclusion
+
+================================================================================
+1. EXECUTIVE SUMMARY AND PROJECT AIM
+================================================================================
+
+The VirtualLab-Connector is a Python-based middleware service that bridges a
+cloud-hosted VirtualLab booking backend with a MeshCentral remote-management
+server. Its primary purpose is to automate the lifecycle of remote desktop
+(RDP) access for virtual lab bookings.
+
+AIM OF THE PROJECT
+------------------
+  - Receive booking tasks from the VirtualLab Node.js backend.
+  - Generate time-limited MeshCentral device-sharing (guest desktop) links
+    for the correct lab machine using the meshctrl CLI.
+  - Deliver the RDP link to the end user via email (SMTP).
+  - Report results (RDP link, share ID, success/failure) back to the backend
+    so bookings can be updated in the database.
+  - Revoke MeshCentral shares when bookings are cancelled or deleted.
+
+The connector replaces earlier Node.js logic for MeshCentral link generation
+and email delivery, centralizing that responsibility in a single Python
+service that can run on a Windows host co-located with MeshCentral and
+meshctrl.
+
+================================================================================
+2. PROBLEM STATEMENT AND SOLUTION OVERVIEW
+================================================================================
+
+PROBLEM
+-------
+Virtual lab users book time slots on physical or virtual lab machines. After
+a booking is confirmed, they need a secure, time-bound remote desktop URL.
+Creating and revoking these links manually is error-prone. The main backend
+(cannot run meshctrl directly) must delegate MeshCentral operations to a
+trusted agent.
+
+SOLUTION
+--------
+A dedicated connector process:
+  1. Polls the backend for pending connector tasks (default mode), OR
+     accepts tasks via HTTP (Flask mode) or CLI (testing).
+  2. Invokes meshctrl (Node.js) against the MeshCentral server.
+  3. Parses the RDP URL and share identifier from command output.
+  4. Sends a formatted email to the user.
+  5. POSTs a structured JSON result to the backend callback endpoint.
+
+================================================================================
+3. SYSTEM ARCHITECTURE
+================================================================================
+
+High-level component diagram:
+
+    +------------------+       poll GET        +------------------------+
+    |  VirtualLab      | <-------------------- |  VirtualLab-Connector  |
+    |  Backend         |                       |  (Python)              |
+    |  (Node.js)       | --------------------> |                        |
+    +------------------+   callback POST       +-----------+------------+
+                                                        |
+                        +-------------------------------+
+                        |
+            +-----------v-----------+     subprocess    +----------------+
+            |  MeshCentral Server   | <---------------- |  meshctrl.js   |
+            |  (wss://mesh...)      |                   |  (via Node.js) |
+            +-----------------------+                   +----------------+
+                        |
+            +-----------v-----------+
+            |  Lab workstation      |
+            |  (e.g. FROST Lab)     |
+            +-----------------------+
+
+            +-----------------------+
+            |  User email (SMTP)    |
+            +-----------------------+
+
+Typical booking-create flow:
+
+    Backend          Connector           MeshCentral         User
+       |                 |                    |               |
+       |  GET /poll      |                    |               |
+       |---------------> |                    |               |
+       |  task JSON      |                    |               |
+       | <---------------|                    |               |
+       |                 | devicesharing      |               |
+       |                 |------------------->|               |
+       |                 | RDP URL + shareId  |               |
+       |                 |<-------------------|               |
+       |                 | SMTP email         |               |
+       |                 |---------------------------------->|
+       |  POST /callback |                    |               |
+       |<----------------|                    |               |
+       |  { rdpLink }    |                    |               |
+
+================================================================================
+4. PROJECT STRUCTURE
+================================================================================
+
+VirtualLab-Connector/
+|
+|-- connector.py          Main application (all business logic)
+|-- run-connector.sh      Shell script to start Flask server with .env
+|-- requirements.txt      Python package dependencies
+|-- .gitignore            Ignores venv, __pycache__, *.pyc
+|-- PROJECT_DOCUMENTATION.txt   This document
+
+There is no separate test suite or multi-module package layout; the entire
+service is implemented in connector.py for simplicity and deployment on a
+single Windows machine.
+
+================================================================================
+5. TECHNOLOGY STACK AND DEPENDENCIES
+================================================================================
+
+Component              Technology
+---------------------  --------------------------------------------------
+Runtime                Python 3
+HTTP client            requests
+Web framework (opt.)   Flask
+Environment loading    python-dotenv (imported; config may be inline)
+MeshCentral CLI        meshctrl.js (Node.js subprocess)
+Remote management      MeshCentral (WebSocket URL: wss://...)
+Email                  smtplib (Gmail SMTP, STARTTLS)
+Process execution      subprocess
+
+requirements.txt:
+------------------
+  flask
+  python-dotenv
+  requests
+
+External prerequisites (not in pip):
+  - Node.js installed on the connector host
+  - meshctrl.js at configured path (default: D:\mesh\node_modules\meshcentral\)
+  - Network access to MeshCentral server and backend URLs
+  - Valid SMTP credentials for outbound email
+
+================================================================================
+6. CORE COMPONENTS (DETAILED)
+================================================================================
+
+6.1 CONFIGURATION BLOCK
+    Central constants at the top of connector.py define:
+      - SMTP sender credentials and server settings
+      - Backend poll and callback URLs
+      - Bearer token for API authentication
+      - MeshCentral URL, credentials, meshctrl path, working directory
+      - LAB_NODE_MAP: human-readable lab name -> MeshCentral node ID
+
+6.2 DATA LAYER
+    BookingPayload  - inbound task from backend
+    ConnectorResult - outbound result to backend and CLI/HTTP response
+    ConnectorTaskType - enum aligned with backend Prisma schema
+
+6.3 MESHCENTRAL LAYER
+    _run_meshctrl()       - executes node meshctrl.js with timeout
+    generate_rdp_link()   - creates guest desktop share
+    revoke_rdp_link()     - removes share by ID or lists/removes all shares
+    _extract_url()        - regex fallback for RDP URL in output
+    _extract_share_id()   - parses ShareID from meshctrl output
+
+6.4 EMAIL LAYER
+    send_email() - multipart plain + HTML email with booking details
+
+6.5 BACKEND LAYER
+    poll_backend()         - infinite loop, GET tasks every 5 seconds
+    post_result_to_backend() - POST JSON result with Bearer auth
+
+6.6 TASK DISPATCH
+    dispatch_task() - routes by taskType to specialized handlers
+
+6.7 ENTRY POINTS
+    main()      - argparse: --serve, --json, or default poll
+    run_server() - Flask HTTP API
+    run_cli()    - one-shot JSON stdin/--json
+
+================================================================================
+7. DATA MODELS
+================================================================================
+
+7.1 ConnectorTaskType (Enum)
+----------------------------
+  BOOKING_CREATE  - treated same as GENERATE_RDP (create share + email)
+  BOOKING_DELETE  - revoke MeshCentral share
+  GENERATE_RDP    - default; generate link and email user
+  FILE_TRANSFER   - stub (not implemented)
+  STATUS_UPDATE   - stub (not implemented)
+
+7.2 BookingPayload (Inbound)
+----------------------------
+  Field              Type        Required  Description
+  -----------------  ----------  --------  ----------------------------------
+  bookingId          string      yes       Unique booking identifier
+  userId             string      yes       User identifier in backend DB
+  userEmail          string      yes       Recipient for RDP email
+  labName            string      yes       e.g. "FROST Lab"
+  start              string      yes       ISO 8601 booking start time
+  end                string      yes       ISO 8601 booking end time
+  durationMinutes    int         yes       Share duration for meshctrl
+  meshNodeId         string      no*       MeshCentral device node ID
+  shareId            string      no        Required for BOOKING_DELETE
+  callbackUrl        string      no        Override default callback URL
+  taskType           string      no        Default: GENERATE_RDP
+
+  * meshNodeId resolved from LAB_NODE_MAP when labName is known; otherwise
+    must be supplied in payload.
+
+7.3 ConnectorResult (Outbound)
+------------------------------
+  Field       Type        Description
+  ----------  ----------  --------------------------------------------------
+  bookingId   string      Same as inbound booking
+  rdpLink     string|null HTTPS RDP/guest URL (null on delete/failure)
+  success     bool        true if primary operation succeeded
+  error       string|null Semicolon-separated error messages if any
+  stdout      string      meshctrl standard output (debug/audit)
+  stderr      string      meshctrl standard error (debug/audit)
+  shareId     string|null MeshCentral share ID for later revocation
+
+================================================================================
+8. TASK TYPES AND BUSINESS LOGIC
+================================================================================
+
+8.1 GENERATE_RDP / BOOKING_CREATE
+---------------------------------
+  Steps:
+    1. Convert booking start time from UTC ISO to local timezone string.
+    2. Resolve mesh node ID from LAB_NODE_MAP or payload.
+    3. Run: meshctrl devicesharing --add guest --type desktop ...
+    4. Parse URL: line or first https URL in output.
+    5. Parse shareId from output.
+    6. If link exists, send email to userEmail.
+    7. success = true if rdpLink was generated (email failure recorded in
+       error but does not flip success to false).
+    8. POST ConnectorResult to backend callback.
+
+8.2 BOOKING_DELETE
+------------------
+  Two revocation strategies:
+
+  Path A - shareId provided in payload:
+    Run meshctrl devicesharing --remove <shareId>
+
+  Path B - shareId missing:
+    List all shares on the node, then remove each share ID found.
+    Returns success if at least one removal succeeds.
+
+  Result posted to backend with rdpLink=null.
+
+8.3 FILE_TRANSFER / STATUS_UPDATE
+---------------------------------
+  Placeholder handlers return success=false with "not yet implemented"
+  and still POST result to backend for observability.
+
+================================================================================
+9. MAIN CODE SNIPPETS
+================================================================================
+(Secrets shown as placeholders; configure actual values in connector.py)
+
+9.1 CONFIGURATION AND LAB MAPPING
+---------------------------------
+
+    SENDER_EMAIL    = "<smtp_account@gmail.com>"
+    SENDER_APP_PASS = "<gmail_app_password>"
+
+    BACKEND_POLL_URL     = "https://<backend-host>/connector/poll"
+    BACKEND_CALLBACK_URL = "https://<backend-host>/connector/callback"
+    SECRET_TOKEN         = "<shared_bearer_token>"
+
+    MESHCTRL_PATH    = r"D:\mesh\node_modules\meshcentral\meshctrl.js"
+    MESHCENTRAL_URL  = "wss://mesh.virtuallabx.com"
+    MESHCENTRAL_USER = "<mesh_admin_user>"
+    MESHCENTRAL_PASS = "<mesh_admin_password>"
+    MESHCTRL_CWD     = r"D:\mesh"
+
+    LAB_NODE_MAP: dict[str, str] = {
+        "FROST Lab": "<meshcentral_node_id>",
+    }
+
+
+9.2 DATA CLASSES
+----------------
+
+    @dataclass
+    class BookingPayload:
+        bookingId:       str
+        userId:          str
+        userEmail:       str
+        labName:         str
+        start:           str
+        end:             str
+        meshNodeId:      str
+        durationMinutes: int
+        shareId:         Optional[str] = None
+        callbackUrl:     Optional[str] = None
+        taskType:        str = ConnectorTaskType.GENERATE_RDP
+
+    @dataclass
+    class ConnectorResult:
+        bookingId: str
+        rdpLink:   Optional[str]
+        success:   bool
+        error:     Optional[str]
+        stdout:    str
+        stderr:    str
+        shareId:   Optional[str] = None
+
+
+9.3 RDP LINK GENERATION (meshctrl)
+----------------------------------
+
+    def generate_rdp_link(payload: BookingPayload):
+        utc_time   = datetime.fromisoformat(payload.start.replace("Z", "+00:00"))
+        local_time = utc_time.astimezone()
+        start_str  = local_time.strftime("%Y-%m-%dT%H:%M:%S")
+
+        mesh_node_id = LAB_NODE_MAP.get(payload.labName, payload.meshNodeId)
+
+        cmd = [
+            "node", MESHCTRL_PATH, "devicesharing",
+            "--url", MESHCENTRAL_URL,
+            "--loginuser", MESHCENTRAL_USER,
+            "--loginpass", MESHCENTRAL_PASS,
+            "--id", mesh_node_id,
+            "--add", "guest",
+            "--type", "desktop",
+            "--start", start_str,
+            "--duration", str(payload.durationMinutes),
+        ]
+        returncode, stdout, stderr = _run_meshctrl(cmd)
+        # Parse "URL:" line or regex https URL from output
+        # Parse shareId for backend storage and future revocation
+        return rdp_link, share_id, stdout, stderr
+
+
+9.4 BACKEND CALLBACK
+--------------------
+
+    def post_result_to_backend(result: ConnectorResult,
+                               callback_url: Optional[str] = None) -> bool:
+        url     = callback_url or BACKEND_CALLBACK_URL
+        headers = {
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {SECRET_TOKEN}",
+        }
+        resp = requests.post(url, json=asdict(result), headers=headers, timeout=15)
+        resp.raise_for_status()
+        return True
+
+
+9.5 TASK DISPATCH
+-----------------
+
+    def dispatch_task(payload: BookingPayload) -> ConnectorResult:
+        task_type = ConnectorTaskType(payload.taskType)
+
+        if task_type in (ConnectorTaskType.GENERATE_RDP,
+                         ConnectorTaskType.BOOKING_CREATE):
+            return _handle_generate_rdp(payload)
+        elif task_type == ConnectorTaskType.BOOKING_DELETE:
+            return _handle_booking_delete(payload)
+        # ... FILE_TRANSFER, STATUS_UPDATE stubs ...
+
+
+9.6 POLLING LOOP
+----------------
+
+    def poll_backend() -> None:
+        while True:
+            resp = requests.get(BACKEND_POLL_URL, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data:
+                    payload = parse_payload(data)
+                    result  = dispatch_task(payload)
+            time.sleep(5)
+
+
+9.7 PAYLOAD VALIDATION
+----------------------
+
+    def parse_payload(data: dict) -> BookingPayload:
+        required = ["bookingId", "userId", "userEmail", "labName",
+                    "start", "end", "durationMinutes"]
+        # Resolve meshNodeId from LAB_NODE_MAP or payload.meshNodeId
+        return BookingPayload(...)
+
+================================================================================
+10. BACKEND INTEGRATION (POLL AND CALLBACK)
+================================================================================
+
+10.1 POLL ENDPOINT (Connector -> Backend)
+-----------------------------------------
+  Method   : GET
+  URL      : BACKEND_POLL_URL
+  Headers  : Authorization: Bearer <SECRET_TOKEN>
+             Content-Type: application/json
+
+  Expected responses:
+    200 + empty/null body     No pending task; connector sleeps 5s
+    200 + JSON task object    Process immediately via dispatch_task()
+    401                       Token mismatch; logged as error
+
+  Example task body (GENERATE_RDP):
+  {
+    "bookingId": "bk_abc123",
+    "userId": "user_001",
+    "userEmail": "student@university.edu",
+    "labName": "FROST Lab",
+    "start": "2026-05-20T10:00:00.000Z",
+    "end": "2026-05-20T12:00:00.000Z",
+    "durationMinutes": 120,
+    "taskType": "GENERATE_RDP"
+  }
+
+  Example task body (BOOKING_DELETE):
+  {
+    "bookingId": "bk_abc123",
+    "userId": "user_001",
+    "userEmail": "student@university.edu",
+    "labName": "FROST Lab",
+    "start": "2026-05-20T10:00:00.000Z",
+    "end": "2026-05-20T12:00:00.000Z",
+    "durationMinutes": 120,
+    "shareId": "share_xyz789",
+    "taskType": "BOOKING_DELETE"
+  }
+
+10.2 CALLBACK ENDPOINT (Connector -> Backend)
+---------------------------------------------
+  Method   : POST
+  URL      : BACKEND_CALLBACK_URL (or per-task callbackUrl)
+  Headers  : Same Bearer token
+  Body     : JSON serialization of ConnectorResult
+
+  Example success callback:
+  {
+    "bookingId": "bk_abc123",
+    "rdpLink": "https://mesh.example.com/?view=...&guest=...",
+    "success": true,
+    "error": null,
+    "stdout": "... meshctrl output ...",
+    "stderr": "",
+    "shareId": "share_xyz789"
+  }
+
+  Example failure callback:
+  {
+    "bookingId": "bk_abc123",
+    "rdpLink": null,
+    "success": false,
+    "error": "Failed to generate RDP link.",
+    "stdout": "",
+    "stderr": "login failed",
+    "shareId": null
+  }
+
+  Backend responsibility: persist rdpLink and shareId on the booking record,
+  update booking status, and expose the link in the user-facing application.
+
+================================================================================
+11. MESHCENTRAL INTEGRATION
+================================================================================
+
+11.1 meshctrl execution
+-----------------------
+  Commands run via subprocess:
+    - Working directory: MESHCTRL_CWD (e.g. D:\mesh)
+    - Executable: node <MESHCTRL_PATH> <subcommand> [flags]
+    - Timeout: 60 seconds
+
+11.2 Create share command (conceptual)
+--------------------------------------
+  node meshctrl.js devicesharing
+    --url wss://mesh.virtuallabx.com
+    --loginuser <admin>
+    --loginpass <password>
+    --id <node_id>
+    --add guest
+    --type desktop
+    --start 2026-05-20T15:30:00
+    --duration 120
+
+11.3 Output parsing
+-------------------
+  Primary: line starting with "URL:" contains the guest RDP link.
+  Fallback: regex search for first http(s) URL in combined stdout+stderr.
+  shareId: lines like "ShareID: ..." or "id: ..." (case-insensitive).
+
+11.4 Lab to node mapping
+------------------------
+  Only labs listed in LAB_NODE_MAP are auto-resolved. To add a new lab,
+  insert an entry:
+
+    LAB_NODE_MAP["New Lab Name"] = "<meshcentral_device_node_id>"
+
+  Alternatively, pass meshNodeId explicitly in the task payload.
+
+================================================================================
+12. EMAIL NOTIFICATION SYSTEM
+================================================================================
+
+When an RDP link is successfully generated:
+  - SMTP server: smtp.gmail.com:587 with STARTTLS
+  - From: SENDER_EMAIL
+  - To: payload.userEmail
+  - Subject: "Your VirtualLab RDP Link - {labName}"
+  - Body: plain text + HTML table with link, booking ID, start, end
+
+Email failure is appended to ConnectorResult.error but success remains true
+if the link was generated, ensuring the backend still receives the URL.
+
+================================================================================
+13. OPERATING MODES
+================================================================================
+
+Mode          Command                          Use case
+------------  -------------------------------  ------------------------------
+Poll (default) python connector.py             Production: pull tasks from
+                                               backend continuously
+
+Flask server  python connector.py --serve       Backend pushes tasks via HTTP;
+              [--host 0.0.0.0] [--port 8000]   run-connector.sh uses this mode
+
+CLI / stdin   python connector.py --json '...'  Manual testing, scripts,
+              echo '{...}' | python connector.py CI, debugging
+
+================================================================================
+14. HTTP API REFERENCE (FLASK MODE)
+================================================================================
+
+Authentication: Authorization: Bearer <SECRET_TOKEN> on all endpoints below.
+
+POST /connector/generate-rdp
+  Body: BookingPayload JSON
+  Response: ConnectorResult JSON
+  Status: 200 if success, 500 if link generation failed
+
+POST /connector/task
+  Body: BookingPayload JSON (taskType selects handler)
+  Response: ConnectorResult JSON
+  Status: 200 if success, 500 on failure
+
+GET /health
+  Response: {"status": "ok"}
+  No authentication required in current implementation
+
+Note: Flask mode still calls post_result_to_backend() after processing, so
+the backend receives both the HTTP response and the callback POST.
+
+================================================================================
+15. CONFIGURATION REFERENCE
+================================================================================
+
+All primary settings are defined as module-level constants in connector.py:
+
+  Variable               Purpose
+  ---------------------  -------------------------------------------------
+  SENDER_EMAIL           Gmail account for outbound mail
+  SENDER_APP_PASS        Gmail app-specific password
+  BACKEND_POLL_URL       GET endpoint for pending tasks
+  BACKEND_CALLBACK_URL   POST endpoint for results
+  SECRET_TOKEN           Shared Bearer token with backend
+  MESHCTRL_PATH          Absolute path to meshctrl.js
+  MESHCENTRAL_URL        WebSocket URL of MeshCentral server
+  MESHCENTRAL_USER       MeshCentral login username
+  MESHCENTRAL_PASS       MeshCentral login password
+  MESHCTRL_CWD           subprocess working directory
+  LAB_NODE_MAP           Lab display name -> node ID
+  SMTP_HOST / SMTP_PORT  Mail server (default Gmail)
+  SMTP_USE_TLS           Enable STARTTLS (true)
+
+Optional per-task override: callbackUrl in poll/HTTP payload.
+
+run-connector.sh optionally sources .env.connector if present, then starts
+Flask with: python3 connector.py --serve
+
+================================================================================
+16. DEPLOYMENT AND EXECUTION
+================================================================================
+
+16.1 Recommended deployment topology
+------------------------------------
+  - Windows host with MeshCentral agent/meshctrl installed
+  - Connector runs as a persistent process (poll mode) or Windows service
+  - Outbound HTTPS to backend (e.g. Render) and MeshCentral
+  - Outbound SMTP to Gmail
+
+16.2 Installation steps
+-----------------------
+  1. Clone repository to connector host.
+  2. python -m venv venv && venv\Scripts\activate
+  3. pip install -r requirements.txt
+  4. Verify Node.js and meshctrl path.
+  5. Update connector.py configuration constants.
+  6. Run: python connector.py          (poll mode)
+     Or:  bash run-connector.sh       (Flask mode on port 8000)
+
+16.3 Example CLI test
+---------------------
+  python connector.py --json "{\"bookingId\":\"test1\",\"userId\":\"u1\",\
+\"userEmail\":\"you@example.com\",\"labName\":\"FROST Lab\",\
+\"start\":\"2026-05-20T10:00:00Z\",\"end\":\"2026-05-20T12:00:00Z\",\
+\"durationMinutes\":60,\"taskType\":\"GENERATE_RDP\"}"
+
+================================================================================
+17. SECURITY CONSIDERATIONS
+================================================================================
+
+  - Credentials (SMTP, MeshCentral, SECRET_TOKEN) are currently stored in
+    source code. For production, move to environment variables or a secrets
+    manager and never commit real passwords to version control.
+  - Bearer token must match between connector and backend on poll/callback.
+  - RDP guest links are time-limited per meshctrl --duration and --start.
+  - Revocation on BOOKING_DELETE limits exposure after booking ends.
+  - Consider restricting Flask --serve to localhost or a private network.
+  - stdout/stderr in callbacks may contain sensitive meshctrl output; backend
+    should avoid exposing raw logs to end users.
+
+================================================================================
+18. ERROR HANDLING AND LOGGING
+================================================================================
+
+  - Python logging module: INFO level, timestamped messages.
+  - meshctrl failures: captured in stdout/stderr fields of ConnectorResult.
+  - subprocess timeout: 60s, returns error string in stderr.
+  - Payload validation: ValueError with missing field list; poll loop logs
+    and continues without crashing.
+  - HTTP 401 on poll: logged as SECRET_TOKEN mismatch.
+  - Backend POST failures: logged; connector does not retry automatically.
+  - Email exceptions: returned as error string, included in result.error.
+
+================================================================================
+19. LIMITATIONS AND FUTURE ENHANCEMENTS
+================================================================================
+
+CURRENT LIMITATIONS
+  - Single-file monolith; no unit tests in repository.
+  - FILE_TRANSFER and STATUS_UPDATE task types are not implemented.
+  - Poll loop has fixed 5-second interval; no exponential backoff.
+  - Callback POST has no retry mechanism on network failure.
+  - Hardcoded configuration requires code edit to change environments.
+  - Connector host must be Windows-oriented paths (D:\mesh) as written.
+  - BOOKING_DELETE without shareId removes ALL shares on a node (aggressive).
+
+PLANNED / SUGGESTED ENHANCEMENTS
+  - Externalize all secrets to .env or OS environment variables.
+  - Implement FILE_TRANSFER and STATUS_UPDATE handlers.
+  - Add retry with backoff for backend callback.
+  - Support multiple labs without code changes (backend supplies meshNodeId).
+  - Docker or systemd service definition for production uptime.
+  - Structured metrics / health reporting beyond GET /health.
+  - Redact or truncate stdout/stderr in production callbacks.
+
+================================================================================
+20. CONCLUSION
+================================================================================
+
+The VirtualLab-Connector is a focused integration service that automates
+MeshCentral guest desktop sharing for virtual lab bookings. It closes the
+gap between a cloud booking API and on-premise remote access infrastructure
+by generating RDP links, notifying users by email, and synchronizing results
+with the central backend.
+
+Its three execution modes (poll, HTTP, CLI) support production deployment,
+push-based integration, and developer testing. The task-type enum and payload
+schema are designed for extension as VirtualLab adds file transfer and status
+features.
+
+This document, together with connector.py, provides a complete reference for
+understanding, deploying, and maintaining the VirtualLab MeshCentral Connector.
+
+================================================================================
+                              END OF DOCUMENT
+================================================================================
